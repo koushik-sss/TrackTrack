@@ -31,6 +31,13 @@ struct MetalView: UIViewRepresentable {
     }
 }
 
+struct RenderConfig {
+    var gridColor: SIMD4<Float>
+    var arrowColor: SIMD4<Float>
+    var pathColor: SIMD4<Float>
+    var backgroundColor: SIMD4<Float>
+}
+
 class Renderer: NSObject, MTKViewDelegate {
     var parent: MetalView
     var device: MTLDevice!
@@ -52,8 +59,17 @@ class Renderer: NSObject, MTKViewDelegate {
     private var gridVertexCount = 0
     private let gridSpacing: Float = 0.2  // Smaller, more consistent grid
     private let gridLineWidth: Float = 0.002
+    private var renderConfig: RenderConfig
     
     init(_ parent: MetalView) {
+        // Initialize render config with colors
+        self.renderConfig = RenderConfig(
+            gridColor: SIMD4<Float>(0.3, 0.3, 0.3, 0.4),  // Subtle grid
+            arrowColor: SIMD4<Float>(0.0, 0.47, 1.0, 0.9), // Main arrow
+            pathColor: SIMD4<Float>(0.8, 0.8, 0.8, 0.3),   // Path trace
+            backgroundColor: SIMD4<Float>(0.12, 0.12, 0.12, 1.0) // Dark background
+        )
+        
         self.parent = parent
         super.init()
         
@@ -201,55 +217,97 @@ class Renderer: NSObject, MTKViewDelegate {
         return SIMD2<Float>(x * viewportAspect, y)
     }
     
+    func updateColorScheme(isDark: Bool) {
+        if isDark {
+            renderConfig = RenderConfig(
+                gridColor: SIMD4<Float>(0.3, 0.3, 0.3, 0.4),
+                arrowColor: SIMD4<Float>(0.0, 0.47, 1.0, 0.9),
+                pathColor: SIMD4<Float>(0.8, 0.8, 0.8, 0.3),
+                backgroundColor: SIMD4<Float>(0.12, 0.12, 0.12, 1.0)
+            )
+        } else {
+            renderConfig = RenderConfig(
+                gridColor: SIMD4<Float>(0.7, 0.7, 0.7, 0.4),
+                arrowColor: SIMD4<Float>(0.0, 0.47, 1.0, 0.9),
+                pathColor: SIMD4<Float>(0.2, 0.2, 0.2, 0.3),
+                backgroundColor: SIMD4<Float>(0.95, 0.95, 0.97, 1.0)
+            )
+        }
+    }
+    
     func draw(in view: MTKView) {
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor else { return }
         
         let commandBuffer = commandQueue.makeCommandBuffer()
         
-        // Update path texture
+        // Update path texture remains unchanged...
         let computeEncoder = commandBuffer?.makeComputeCommandEncoder()
         computeEncoder?.setComputePipelineState(computePipelineState!)
         computeEncoder?.setTexture(pathTexture, index: 0)
         var currentPos = SIMD2<Float>(Float(position.x), Float(position.y))
         computeEncoder?.setBytes(&currentPos, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
-        
         let threadgroupSize = MTLSizeMake(16, 16, 1)
         let threadgroups = MTLSizeMake(pathTexture!.width / 16, pathTexture!.height / 16, 1)
         computeEncoder?.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadgroupSize)
         computeEncoder?.endEncoding()
         
-        // Render path and arrow
         let renderEncoder = commandBuffer?.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
         
-        // Update transforms for rendering
-        var transform = Transform(
+        // Set a factor to scale the device movement to canvas coordinates
+        let canvasMovementFactor: Float = 0.001  // Adjust as needed
+        
+        // Calculate device (raw) offset and user offset
+        let deviceOffset = SIMD2<Float>(Float(position.x), Float(position.y)) * canvasMovementFactor
+        let userOffset = SIMD2<Float>(Float(offset.x), Float(offset.y))
+        
+        // Grid transform (static, only affected by user pan/zoom)
+        var gridTransform = Transform(
             scale: Float(scale),
-            offset: SIMD2<Float>(Float(offset.x), Float(offset.y)),
+            offset: userOffset,
             viewport: SIMD2<Float>(Float(viewport.width), Float(viewport.height)),
-            rotation: Float(rotation)  // Add rotation to transform
+            rotation: 0
         )
         
-        // 1) Draw grid first
+        // Moving arrow/path transform uses both deviceOffset (scaled) and user offset, and applies rotation.
+        var moveTransform = Transform(
+            scale: Float(scale),
+            offset: deviceOffset + userOffset,
+            viewport: SIMD2<Float>(Float(viewport.width), Float(viewport.height)),
+            rotation: Float(rotation)
+        )
+        
+        // Set background color from config
+        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
+            red: Double(renderConfig.backgroundColor.x),
+            green: Double(renderConfig.backgroundColor.y),
+            blue: Double(renderConfig.backgroundColor.z),
+            alpha: Double(renderConfig.backgroundColor.w)
+        )
+        
+        // Drawing code updated to pass renderConfig to shaders
+        renderEncoder?.setVertexBytes(&renderConfig, length: MemoryLayout<RenderConfig>.stride, index: 2)
+        
+        // 1) Draw grid with gridTransform
         if let gridPSO = gridPipelineState, let gridBuf = gridBuffer {
             renderEncoder?.setRenderPipelineState(gridPSO)
             renderEncoder?.setVertexBuffer(gridBuf, offset: 0, index: 0)
-            renderEncoder?.setVertexBytes(&transform, length: MemoryLayout<Transform>.stride, index: 1)
+            renderEncoder?.setVertexBytes(&gridTransform, length: MemoryLayout<Transform>.stride, index: 1)
             renderEncoder?.drawPrimitives(type: .line, vertexStart: 0, vertexCount: gridVertexCount)
         }
         
-        // Draw path with transform
+        // 2) Draw moving path using moveTransform
         if let pathBuffer = pathBuffer {
             renderEncoder?.setRenderPipelineState(pathPipelineState!)
             renderEncoder?.setVertexBuffer(pathBuffer, offset: 0, index: 0)
-            renderEncoder?.setVertexBytes(&transform, length: MemoryLayout<Transform>.stride, index: 1)
+            renderEncoder?.setVertexBytes(&moveTransform, length: MemoryLayout<Transform>.stride, index: 1)
             renderEncoder?.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: pathPositions.count)
         }
         
-        // Update arrow drawing
+        // 3) Draw moving/rotating arrow using moveTransform
         renderEncoder?.setRenderPipelineState(pipelineState)
         renderEncoder?.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        renderEncoder?.setVertexBytes(&transform, length: MemoryLayout<Transform>.stride, index: 1)
+        renderEncoder?.setVertexBytes(&moveTransform, length: MemoryLayout<Transform>.stride, index: 1)
         renderEncoder?.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 5)
         
         renderEncoder?.endEncoding()

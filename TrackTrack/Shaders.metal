@@ -17,9 +17,17 @@ struct Transform {
     float rotation;   // New rotation in radians
 };
 
+struct RenderConfig {
+    float4 gridColor;
+    float4 arrowColor;
+    float4 pathColor;
+    float4 backgroundColor;
+};
+
 vertex VertexOut vertexShader(uint vertexID [[vertex_id]],
                             device const VertexIn* vertices [[buffer(0)]],
-                            constant Transform& transform [[buffer(1)]]) {
+                            constant Transform& transform [[buffer(1)]],
+                            constant RenderConfig& config [[buffer(2)]]) {
     VertexOut out;
     float2 pos = vertices[vertexID].position;
     // Apply rotation:
@@ -36,18 +44,15 @@ vertex VertexOut vertexShader(uint vertexID [[vertex_id]],
     final.x *= aspect;
     
     out.position = float4(final, 0.0, 1.0);
-    // Gradient remains unchanged:
-    float3 baseColor = float3(0.0, 0.47, 1.0);
-    float3 highlightColor = float3(0.3, 0.6, 1.0);
-    float gradientFactor = smoothstep(-0.04, 0.08, pos.y);
-    float3 color = mix(baseColor, highlightColor, gradientFactor);
-    out.color = float4(color, 0.9);
+    // Use config colors instead of hardcoded values
+    out.color = config.arrowColor;
     return out;
 }
 
 vertex VertexOut pathVertexShader(uint vertexID [[vertex_id]],
                                 device const float2* positions [[buffer(0)]],
-                                constant Transform& transform [[buffer(1)]]) {
+                                constant Transform& transform [[buffer(1)]],
+                                constant RenderConfig& config [[buffer(2)]]) {
     VertexOut out;
     float2 pos = positions[vertexID];
     // Apply rotation similar to above:
@@ -63,7 +68,30 @@ vertex VertexOut pathVertexShader(uint vertexID [[vertex_id]],
     final.x *= aspect;
     
     out.position = float4(final, 0.0, 1.0);
-    out.color = float4(0.8, 0.8, 0.8, 0.3);
+    out.color = config.pathColor;
+    return out;
+}
+
+vertex VertexOut gridVertexShader(uint vertexID [[vertex_id]],
+                                device const float2* positions [[buffer(0)]],
+                                constant Transform& transform [[buffer(1)]],
+                                constant RenderConfig& config [[buffer(2)]]) {
+    VertexOut out;
+    float2 pos = positions[vertexID];
+    
+    // Apply snap-to-grid for consistent spacing
+    float gridSize = 0.2; // Consistent grid size
+    pos = round(pos / gridSize) * gridSize;
+    
+    // Apply transforms
+    float aspect = transform.viewport.x / transform.viewport.y;
+    float2 scaled = pos * transform.scale;
+    float2 offs = transform.offset / transform.viewport * 2.0;
+    float2 final = scaled + offs;
+    final.x *= aspect;
+    
+    out.position = float4(final, 0.0, 1.0);
+    out.color = config.gridColor;
     return out;
 }
 

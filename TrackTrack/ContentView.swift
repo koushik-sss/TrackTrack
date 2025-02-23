@@ -4,89 +4,98 @@ import MetalKit
 
 class MotionManager: ObservableObject {
     private let motionManager = CMMotionManager()
-    @Published var accelerometer: SIMD3<Double> = SIMD3(x: 0, y: 0, z: 0)
-    @Published var gyroscope: SIMD3<Double> = SIMD3(x: 0, y: 0, z: 0)
+    @Published var accelerometer: SIMD3<Double> = .zero
+    @Published var gyroscope: SIMD3<Double> = .zero
     @Published var position: CGPoint = .zero
     @Published var pathUpdated: Bool = false
-    @Published var orientation: Float = 0  // New orientation (in radians)
+    @Published var orientation: Float = 0
 
+    private var currentPosition: SIMD2<Float> = .zero
+    private let translationScale: Float = 500.0
     private var lastUpdateTime: TimeInterval?
-    private let sensitivityFactor: Float = 500.0  // Increased sensitivity for x,y movement
-    private var lastPosition: SIMD2<Float> = .zero
 
     init() {
         startUpdates()
     }
-    
+
     func startUpdates() {
-        if motionManager.isAccelerometerAvailable && motionManager.isGyroAvailable {
-            motionManager.accelerometerUpdateInterval = 0.01  // 100Hz updates
-            motionManager.gyroUpdateInterval = 0.01
-            
-            motionManager.startAccelerometerUpdates(to: .main) { [weak self] data, error in
-                guard let self = self, let data = data else { return }
-                self.accelerometer = SIMD3(x: data.acceleration.x,
-                                           y: data.acceleration.y,
-                                           z: data.acceleration.z)
-                
-                let currentTime = Date().timeIntervalSince1970
-                let dt: Float = self.lastUpdateTime != nil ? Float(currentTime - self.lastUpdateTime!) : 0.01
-                self.lastUpdateTime = currentTime
-                
-                // Use only x and y for canvas movement
-                let rawAccel = SIMD2<Float>(
-                    Float(data.acceleration.x),
-                    Float(data.acceleration.y)
-                )
-                
-                // Increase movement change
-                self.lastPosition += rawAccel * self.sensitivityFactor * dt
-                
-                DispatchQueue.main.async {
-                    self.position = CGPoint(
-                        x: CGFloat(self.lastPosition.x),
-                        y: CGFloat(self.lastPosition.y)
-                    )
-                    self.pathUpdated = true
-                }
+        guard motionManager.isAccelerometerAvailable else { return }
+
+        motionManager.accelerometerUpdateInterval = 1.0 / 60.0
+        motionManager.startAccelerometerUpdates(to: .main) { [weak self] data, error in
+            guard let self = self, let data = data else { return }
+
+            // Update accelerometer display
+            self.accelerometer = SIMD3(
+                x: data.acceleration.x,
+                y: data.acceleration.y,
+                z: data.acceleration.z
+            )
+
+            let currentTime = Date().timeIntervalSince1970
+            let dt: Float
+            if let lastTime = self.lastUpdateTime {
+                dt = Float(currentTime - lastTime)
+            } else {
+                dt = 1.0 / 60.0
             }
-            
-            motionManager.startGyroUpdates(to: .main) { [weak self] data, error in
-                guard let self = self, let data = data else { return }
-                let currentTime = Date().timeIntervalSince1970
-                let dt: Float = self.lastUpdateTime != nil ? Float(currentTime - self.lastUpdateTime!) : 0.01
-                // Integrate the z-axis rotation; adjust sign if needed
-                self.orientation += Float(data.rotationRate.z) * dt
-                DispatchQueue.main.async {
-                    // Gyro readings are still published separately
-                    self.gyroscope = SIMD3(x: data.rotationRate.x, y: data.rotationRate.y, z: data.rotationRate.z)
-                }
+            self.lastUpdateTime = currentTime
+
+            // Direct position update from accelerometer
+            let acceleration = SIMD2<Float>(
+                Float(data.acceleration.x),
+                Float(data.acceleration.y)
+            )
+
+            // Update position
+            self.currentPosition += acceleration * self.translationScale * dt
+
+            DispatchQueue.main.async {
+                self.position = CGPoint(
+                    x: CGFloat(self.currentPosition.x),
+                    y: CGFloat(self.currentPosition.y)
+                )
+                self.pathUpdated = true
+            }
+        }
+
+        // Keep gyro updates for rotation only
+        motionManager.startGyroUpdates(to: .main) { [weak self] data, error in
+            guard let self = self, let data = data else { return }
+            self.gyroscope = SIMD3(
+                x: data.rotationRate.x,
+                y: data.rotationRate.y,
+                z: data.rotationRate.z
+            )
+            DispatchQueue.main.async {
+                self.orientation += Float(data.rotationRate.z) * 0.1
             }
         }
     }
-    
+
     func resetPosition() {
-        lastPosition = .zero
+        currentPosition = .zero
         position = .zero
+        orientation = 0
+        lastUpdateTime = nil
         pathUpdated = true
     }
-    
+
     deinit {
-        motionManager.stopAccelerometerUpdates()
-        motionManager.stopGyroUpdates()
+        motionManager.stopDeviceMotionUpdates()
     }
 }
 
 // Move existing sensor view to its own struct
 struct SensorDataView: View {
     @ObservedObject var motionManager: MotionManager
-    
+
     var body: some View {
         VStack {
             Text("IMU Sensor Data")
                 .font(.title)
                 .padding()
-            
+
             GroupBox("Accelerometer (g)") {
                 VStack(alignment: .leading) {
                     Text(String(format: "X: %.2f", motionManager.accelerometer.x))
@@ -95,7 +104,7 @@ struct SensorDataView: View {
                 }
                 .padding()
             }
-            
+
             GroupBox("Gyroscope (rad/s)") {
                 VStack(alignment: .leading) {
                     Text(String(format: "X: %.2f", motionManager.gyroscope.x))
@@ -119,7 +128,7 @@ struct CanvasView: View {
     @GestureState private var gestureOffset: CGSize = .zero
     @State private var minScale: CGFloat = 0.5
     @State private var maxScale: CGFloat = 4.0
-    
+
     var body: some View {
         VStack {
             HStack {
@@ -130,14 +139,37 @@ struct CanvasView: View {
                         .font(.title2)
                 }
                 .padding()
+
                 Spacer()
+                
+                // Add zoom controls
+                HStack(spacing: 16) {
+                    Button(action: {
+                        withAnimation {
+                            scale = max(minScale, scale / 1.2)
+                        }
+                    }) {
+                        Image(systemName: "minus.magnifyingglass")
+                            .font(.title2)
+                    }
+                    
+                    Button(action: {
+                        withAnimation {
+                            scale = min(maxScale, scale * 1.2)
+                        }
+                    }) {
+                        Image(systemName: "plus.magnifyingglass")
+                            .font(.title2)
+                    }
+                }
+                .padding()
             }
-            
-            MetalView(position: motionManager.position, 
+
+            MetalView(position: motionManager.position,
                      scale: max(minScale, min(maxScale, scale * gestureScale)),
                      offset: CGPoint(
                         x: offset.width + gestureOffset.width,
-                        y: offset.height + gestureOffset.height
+                        y: -(offset.height + gestureOffset.height) // Invert Y-axis
                      ),
                      rotation: CGFloat(motionManager.orientation))
                 .onChange(of: motionManager.pathUpdated) { _, _ in
@@ -187,14 +219,14 @@ struct CanvasView: View {
 // Main content view with tab navigation
 struct ContentView: View {
     @StateObject private var motionManager = MotionManager()
-    
+
     var body: some View {
         TabView {
             SensorDataView(motionManager: motionManager)
                 .tabItem {
                     Label("Sensors", systemImage: "gauge")
                 }
-            
+
             CanvasView(motionManager: motionManager)
                 .tabItem {
                     Label("Canvas", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
