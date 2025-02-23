@@ -36,15 +36,17 @@ vertex VertexOut vertexShader(uint vertexID [[vertex_id]],
     float2 rotated = float2(pos.x * cosR - pos.y * sinR,
                             pos.x * sinR + pos.y * cosR);
     
-    // Then apply scaling and offset:
+    // Instead of multiplying by transform.scale,
+    // use the inverse so that arrow size decreases when zoomed in.
+    float2 scaled = rotated / transform.scale;
+    
+    // Then apply offset:
     float aspect = transform.viewport.x / transform.viewport.y;
-    float2 scaled = rotated * transform.scale;
     float2 offs = transform.offset / transform.viewport * 2.0;
     float2 final = scaled + offs;
     final.x *= aspect;
     
     out.position = float4(final, 0.0, 1.0);
-    // Use config colors instead of hardcoded values
     out.color = config.arrowColor;
     return out;
 }
@@ -79,16 +81,14 @@ vertex VertexOut gridVertexShader(uint vertexID [[vertex_id]],
     VertexOut out;
     float2 pos = positions[vertexID];
     
-    // Apply snap-to-grid for consistent spacing
-    float gridSize = 0.2; // Consistent grid size
+    // Snap-to-grid using a fixed grid size.
+    float gridSize = 0.2;
     pos = round(pos / gridSize) * gridSize;
     
-    // Apply transforms
-    float aspect = transform.viewport.x / transform.viewport.y;
+    // Apply transforms without aspect correction.
     float2 scaled = pos * transform.scale;
     float2 offs = transform.offset / transform.viewport * 2.0;
     float2 final = scaled + offs;
-    final.x *= aspect;
     
     out.position = float4(final, 0.0, 1.0);
     out.color = config.gridColor;

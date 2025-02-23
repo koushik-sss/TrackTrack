@@ -5,7 +5,9 @@ struct MetalView: UIViewRepresentable {
     var position: CGPoint
     var scale: CGFloat
     var offset: CGPoint
-    var rotation: CGFloat   // New rotation property
+    var arrowRotation: CGFloat   // arrow rotation (from sensors)
+    var gridRotation: CGFloat    // grid rotation (from 2‑finger gesture)
+    var isDarkMode: Bool         // for dark mode support
     
     func makeCoordinator() -> Renderer {
         Renderer(self)
@@ -15,11 +17,19 @@ struct MetalView: UIViewRepresentable {
         let mtkView = MTKView()
         mtkView.delegate = context.coordinator
         mtkView.device = MTLCreateSystemDefaultDevice()
-        mtkView.clearColor = MTLClearColor(red: 0.95, green: 0.95, blue: 0.97, alpha: 1) // Subtle off-white
+        // Set initial background color based on dark mode
+        if isDarkMode {
+            mtkView.clearColor = MTLClearColor(red: 0.06, green: 0.07, blue: 0.09, alpha: 1.0)
+        } else {
+            mtkView.clearColor = MTLClearColor(red: 0.95, green: 0.95, blue: 0.97, alpha: 1.0)
+        }
         mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.framebufferOnly = false
         mtkView.layer.cornerRadius = 16
         mtkView.clipsToBounds = true
+        
+        // Initialize with dark mode colors if needed
+        context.coordinator.updateColorScheme(isDark: isDarkMode)
         return mtkView
     }
     
@@ -27,7 +37,9 @@ struct MetalView: UIViewRepresentable {
         context.coordinator.position = position
         context.coordinator.scale = scale
         context.coordinator.offset = offset
-        context.coordinator.rotation = rotation  // Forward rotation
+        context.coordinator.arrowRotation = arrowRotation
+        context.coordinator.gridRotation = gridRotation
+        context.coordinator.updateColorScheme(isDark: isDarkMode)
     }
 }
 
@@ -42,12 +54,17 @@ class Renderer: NSObject, MTKViewDelegate {
     var parent: MetalView
     var device: MTLDevice!
     var commandQueue: MTLCommandQueue!
-    var pipelineState: MTLRenderPipelineState!
+    // Add missing declarations:
+    var vertexBuffer: MTLBuffer?
+    var pipelineState: MTLRenderPipelineState?
+    
+    // Renamed property for sensor-based rotation
+    var arrowRotation: CGFloat = 0  
+    // New grid rotation property controlled by gestures.
+    var gridRotation: CGFloat = 0  
     var position: CGPoint = .zero
     var scale: CGFloat = 1.0
     var offset: CGPoint = .zero
-    var rotation: CGFloat = 0  // New rotation property in renderer
-    var vertexBuffer: MTLBuffer?
     private var pathTexture: MTLTexture?
     private var pathBuffer: MTLBuffer?
     private var pathPositions: [SIMD2<Float>] = []
@@ -57,7 +74,7 @@ class Renderer: NSObject, MTKViewDelegate {
     private var gridPipelineState: MTLRenderPipelineState?
     private var gridBuffer: MTLBuffer?
     private var gridVertexCount = 0
-    private let gridSpacing: Float = 0.2  // Smaller, more consistent grid
+    private let gridSpacing: Float = 0.1  // Decreased from 0.2 to 0.1 for closer grid lines
     private let gridLineWidth: Float = 0.002
     private var renderConfig: RenderConfig
     
@@ -158,21 +175,21 @@ class Renderer: NSObject, MTKViewDelegate {
     
     private func createGridBuffer() {
         var lines = [SIMD2<Float>]()
-        let gridSize: Float = 2.0
+        let extent: Float = 10.0       // Increased extent for an "infinite" feel
+        let spacing: Float = gridSpacing // use same spacing for both directions
+        let count = Int(extent / spacing)
         
-        // Create evenly spaced grid lines
-        for i in -10...10 {
-            let pos = Float(i) * gridSpacing
-            // Vertical lines
-            if pos >= -gridSize && pos <= gridSize {
-                lines.append(SIMD2<Float>(pos, -gridSize))
-                lines.append(SIMD2<Float>(pos, gridSize))
-            }
-            // Horizontal lines
-            if pos >= -gridSize && pos <= gridSize {
-                lines.append(SIMD2<Float>(-gridSize, pos))
-                lines.append(SIMD2<Float>(gridSize, pos))
-            }
+        // Calculate aspect ratio and adjust spacing
+        let aspectRatio = Float(viewport.width / viewport.height)
+        
+        for i in -count...count {
+            let pos = Float(i) * spacing
+            // Vertical lines - adjust spacing by dividing by aspect ratio to match horizontal spacing
+            lines.append(SIMD2<Float>(pos / aspectRatio, -extent))
+            lines.append(SIMD2<Float>(pos / aspectRatio, extent))
+            // Horizontal lines - keep original spacing
+            lines.append(SIMD2<Float>(-extent, pos))
+            lines.append(SIMD2<Float>(extent, pos))
         }
         
         gridVertexCount = lines.count
@@ -207,6 +224,9 @@ class Renderer: NSObject, MTKViewDelegate {
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         viewport = size
+        if size.width > 0 && size.height > 0 {
+            createGridBuffer()  // Recreate grid buffer when viewport changes
+        }
     }
     
     func worldToScreenCoordinates(_ position: SIMD2<Float>) -> SIMD2<Float> {
@@ -220,10 +240,10 @@ class Renderer: NSObject, MTKViewDelegate {
     func updateColorScheme(isDark: Bool) {
         if isDark {
             renderConfig = RenderConfig(
-                gridColor: SIMD4<Float>(0.3, 0.3, 0.3, 0.4),
-                arrowColor: SIMD4<Float>(0.0, 0.47, 1.0, 0.9),
-                pathColor: SIMD4<Float>(0.8, 0.8, 0.8, 0.3),
-                backgroundColor: SIMD4<Float>(0.12, 0.12, 0.12, 1.0)
+                gridColor: SIMD4<Float>(0.25, 0.28, 0.35, 0.3),  // Subtle blue-gray grid
+                arrowColor: SIMD4<Float>(0.0, 0.8, 1.0, 1.0),    // Bright cyan arrow
+                pathColor: SIMD4<Float>(0.4, 0.85, 1.0, 0.35),   // Light cyan path
+                backgroundColor: SIMD4<Float>(0.06, 0.07, 0.09, 1.0)  // Deep dark background with slight blue tint
             )
         } else {
             renderConfig = RenderConfig(
@@ -261,20 +281,20 @@ class Renderer: NSObject, MTKViewDelegate {
         let deviceOffset = SIMD2<Float>(Float(position.x), Float(position.y)) * canvasMovementFactor
         let userOffset = SIMD2<Float>(Float(offset.x), Float(offset.y))
         
-        // Grid transform (static, only affected by user pan/zoom)
+        // Grid transform: use gesture-controlled rotation.
         var gridTransform = Transform(
             scale: Float(scale),
             offset: userOffset,
             viewport: SIMD2<Float>(Float(viewport.width), Float(viewport.height)),
-            rotation: 0
+            rotation: Float(gridRotation)
         )
         
-        // Moving arrow/path transform uses both deviceOffset (scaled) and user offset, and applies rotation.
+        // Arrow/path transform: use sensor-based arrowRotation.
         var moveTransform = Transform(
             scale: Float(scale),
             offset: deviceOffset + userOffset,
             viewport: SIMD2<Float>(Float(viewport.width), Float(viewport.height)),
-            rotation: Float(rotation)
+            rotation: Float(arrowRotation)
         )
         
         // Set background color from config
@@ -305,7 +325,7 @@ class Renderer: NSObject, MTKViewDelegate {
         }
         
         // 3) Draw moving/rotating arrow using moveTransform
-        renderEncoder?.setRenderPipelineState(pipelineState)
+        renderEncoder?.setRenderPipelineState(pipelineState!) // force unwrap
         renderEncoder?.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         renderEncoder?.setVertexBytes(&moveTransform, length: MemoryLayout<Transform>.stride, index: 1)
         renderEncoder?.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 5)

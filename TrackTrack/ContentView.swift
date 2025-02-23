@@ -11,11 +11,44 @@ class MotionManager: ObservableObject {
     @Published var orientation: Float = 0
 
     private var currentPosition: SIMD2<Float> = .zero
-    private let translationScale: Float = 500.0
+    private var currentVelocity: SIMD2<Float> = .zero
+    private let positionScale: Float = 100.0
     private var lastUpdateTime: TimeInterval?
+    private let rotationSensitivity: Float = 0.5
+    
+    // Kalman filter parameters
+    private var positionUncertainty: float2x2 = float2x2(diagonal: SIMD2<Float>(1, 1))
+    private let measurementUncertainty: Float = 0.1
+    private let processUncertainty: Float = 0.1
 
     init() {
         startUpdates()
+    }
+    
+    private func rotateVector(_ vector: SIMD2<Float>, byAngle angle: Float) -> SIMD2<Float> {
+        let cosAngle = cos(angle)
+        let sinAngle = sin(angle)
+        return SIMD2<Float>(
+            vector.x * cosAngle - vector.y * sinAngle,
+            vector.x * sinAngle + vector.y * cosAngle
+        )
+    }
+    
+    private func kalmanUpdate(measurement: SIMD2<Float>, uncertainty: inout float2x2) -> SIMD2<Float> {
+        // Prediction
+        uncertainty += float2x2(diagonal: SIMD2<Float>(processUncertainty, processUncertainty))
+        
+        // Kalman gain
+        let kalmanGain = uncertainty.columns.0 / (uncertainty.columns.0 + measurementUncertainty)
+        
+        // Update
+        let innovation = measurement - currentPosition
+        let position = currentPosition + kalmanGain * innovation
+        
+        // Update uncertainty
+        uncertainty *= (1 - kalmanGain)
+        
+        return position
     }
 
     func startUpdates() {
@@ -25,7 +58,6 @@ class MotionManager: ObservableObject {
         motionManager.startAccelerometerUpdates(to: .main) { [weak self] data, error in
             guard let self = self, let data = data else { return }
 
-            // Update accelerometer display
             self.accelerometer = SIMD3(
                 x: data.acceleration.x,
                 y: data.acceleration.y,
@@ -41,14 +73,26 @@ class MotionManager: ObservableObject {
             }
             self.lastUpdateTime = currentTime
 
-            // Direct position update from accelerometer
-            let acceleration = SIMD2<Float>(
+            // Get acceleration in device coordinates
+            var acceleration = SIMD2<Float>(
                 Float(data.acceleration.x),
                 Float(data.acceleration.y)
             )
-
-            // Update position
-            self.currentPosition += acceleration * self.translationScale * dt
+            
+            // Rotate acceleration vector to world coordinates using current orientation
+            acceleration = self.rotateVector(acceleration, byAngle: self.orientation)
+            
+            // Update velocity with rotated acceleration
+            self.currentVelocity += acceleration * dt * self.positionScale
+            
+            // Predict new position
+            let predictedPosition = self.currentPosition + self.currentVelocity * dt
+            
+            // Apply Kalman filter
+            self.currentPosition = self.kalmanUpdate(
+                measurement: predictedPosition,
+                uncertainty: &self.positionUncertainty
+            )
 
             DispatchQueue.main.async {
                 self.position = CGPoint(
@@ -59,7 +103,7 @@ class MotionManager: ObservableObject {
             }
         }
 
-        // Keep gyro updates for rotation only
+        motionManager.gyroUpdateInterval = 1.0 / 60.0
         motionManager.startGyroUpdates(to: .main) { [weak self] data, error in
             guard let self = self, let data = data else { return }
             self.gyroscope = SIMD3(
@@ -68,21 +112,27 @@ class MotionManager: ObservableObject {
                 z: data.rotationRate.z
             )
             DispatchQueue.main.async {
-                self.orientation += Float(data.rotationRate.z) * 0.1
+                // Update orientation based on gyro z-axis
+                self.orientation += Float(data.rotationRate.z) * self.rotationSensitivity
+                // Normalize orientation to -2π to 2π
+                self.orientation = self.orientation.truncatingRemainder(dividingBy: 2 * .pi)
             }
         }
     }
 
     func resetPosition() {
         currentPosition = .zero
+        currentVelocity = .zero
         position = .zero
         orientation = 0
         lastUpdateTime = nil
         pathUpdated = true
+        positionUncertainty = float2x2(diagonal: SIMD2<Float>(1, 1))
     }
 
     deinit {
-        motionManager.stopDeviceMotionUpdates()
+        motionManager.stopAccelerometerUpdates()
+        motionManager.stopGyroUpdates()
     }
 }
 
@@ -123,95 +173,116 @@ struct CanvasView: View {
     @ObservedObject var motionManager: MotionManager
     @State private var scale: CGFloat = 1.0
     @State private var offset: CGSize = .zero
-    @State private var lastOffset: CGSize = .zero
+    @State private var gridRotation: CGFloat = 0
+    @State private var manualArrowRotation: CGFloat = 0
     @GestureState private var gestureScale: CGFloat = 1.0
     @GestureState private var gestureOffset: CGSize = .zero
+    @GestureState private var gestureRotation: CGFloat = 0
     @State private var minScale: CGFloat = 0.5
     @State private var maxScale: CGFloat = 4.0
+    @Environment(\.colorScheme) var colorScheme
+
+    // Helper function to normalize rotation to -2π to 2π
+    private func normalizeRotation(_ rotation: CGFloat) -> CGFloat {
+        let twoPi = CGFloat.pi * 2
+        let normalized = rotation.truncatingRemainder(dividingBy: twoPi)
+        return normalized
+    }
 
     var body: some View {
         VStack {
             HStack {
-                Button(action: {
+                Button {
                     motionManager.resetPosition()
-                }) {
+                    scale = 1.0
+                    offset = .zero
+                    gridRotation = 0
+                    manualArrowRotation = 0
+                } label: {
                     Image(systemName: "arrow.counterclockwise")
                         .font(.title2)
                 }
                 .padding()
-
-                Spacer()
                 
-                // Add zoom controls
                 HStack(spacing: 16) {
-                    Button(action: {
-                        withAnimation {
-                            scale = max(minScale, scale / 1.2)
-                        }
-                    }) {
+                    Button {
+                        withAnimation { scale = max(minScale, scale / 1.2) }
+                    } label: {
                         Image(systemName: "minus.magnifyingglass")
                             .font(.title2)
                     }
-                    
-                    Button(action: {
-                        withAnimation {
-                            scale = min(maxScale, scale * 1.2)
-                        }
-                    }) {
+                    Button {
+                        withAnimation { scale = min(maxScale, scale * 1.2) }
+                    } label: {
                         Image(systemName: "plus.magnifyingglass")
                             .font(.title2)
                     }
                 }
                 .padding()
             }
-
+            
             MetalView(position: motionManager.position,
-                     scale: max(minScale, min(maxScale, scale * gestureScale)),
-                     offset: CGPoint(
+                      scale: max(minScale, min(maxScale, scale * gestureScale)),
+                      offset: CGPoint(
                         x: offset.width + gestureOffset.width,
-                        y: -(offset.height + gestureOffset.height) // Invert Y-axis
-                     ),
-                     rotation: CGFloat(motionManager.orientation))
-                .onChange(of: motionManager.pathUpdated) { _, _ in
-                    if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                       let window = scene.windows.first,
-                       let mtkView = window.rootViewController?.view as? MTKView,
-                       let renderer = mtkView.delegate as? Renderer {
-                        renderer.updatePath(with: motionManager.position)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(
-                    LinearGradient(
-                        gradient: Gradient(colors: [
-                            Color(uiColor: .systemBackground),
-                            Color(uiColor: .secondarySystemBackground)
-                        ]),
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 16))
-                .shadow(color: .black.opacity(0.1), radius: 8, x: 0, y: 2)
-                .gesture(SimultaneousGesture(
-                    MagnificationGesture()
-                        .updating($gestureScale) { value, state, _ in
-                            state = value
-                        }
-                        .onEnded { value in
-                            scale = max(minScale, min(maxScale, scale * value))
-                        },
+                        y: -(offset.height + gestureOffset.height)
+                      ),
+                      arrowRotation: normalizeRotation(CGFloat(motionManager.orientation) + manualArrowRotation + gestureRotation),
+                      gridRotation: normalizeRotation(gridRotation + gestureRotation),
+                      isDarkMode: colorScheme == .dark)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                LinearGradient(
+                    gradient: Gradient(colors: colorScheme == .dark ?
+                        [Color.black, Color.gray] :
+                        [Color(uiColor: .systemBackground), Color(uiColor: .secondarySystemBackground)]),
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .shadow(color: .black.opacity(0.1), radius: 8, x: 0, y: 2)
+            .overlay(alignment: .bottomTrailing) {
+                Text(String(format: "%.1fx", scale * gestureScale))
+                    .font(.system(.caption, design: .monospaced))
+                    .padding(8)
+                    .background(.ultraThinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .padding(12)
+            }
+            .gesture(
+                SimultaneousGesture(
+                    SimultaneousGesture(
+                        MagnificationGesture()
+                            .updating($gestureScale) { value, state, _ in state = value }
+                            .onEnded { value in
+                                scale = max(minScale, min(maxScale, scale * value))
+                            },
+                        RotationGesture()
+                            .updating($gestureRotation) { value, state, _ in 
+                                state = -normalizeRotation(value.radians)
+                            }
+                            .onEnded { value in
+                                gridRotation = normalizeRotation(gridRotation - value.radians)
+                                manualArrowRotation = normalizeRotation(manualArrowRotation - value.radians)
+                            }
+                    ),
                     DragGesture(minimumDistance: 0)
-                        .updating($gestureOffset) { value, state, _ in
-                            state = value.translation
-                        }
+                        .updating($gestureOffset) { value, state, _ in state = value.translation }
                         .onEnded { value in
                             offset.width += value.translation.width
                             offset.height += value.translation.height
-                            lastOffset = offset
                         }
-                ))
-                .padding()
+                )
+            )
+            .onChange(of: motionManager.pathUpdated) { oldValue, newValue in
+                if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                   let window = scene.windows.first,
+                   let mtkView = window.rootViewController?.view as? MTKView,
+                   let renderer = mtkView.delegate as? Renderer {
+                    renderer.updatePath(with: motionManager.position)
+                }
+            }
+            .padding()
         }
     }
 }
